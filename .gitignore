@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Model checkpoints (symlinks / downloads)
+src/openvla/checkpoints
+src/openvla-oft/checkpoints
+checkpoints/
+
+# Evaluation results and logs
+src/openvla/experiments/logs/
+src/openvla-oft/experiments/logs/
+src/openvla/rollouts_dev/
+rollouts/
+wandb/
+*.log
+*.out
+*.jsonl
+*.npz
+*.npy
+*.mp4
+*.pt

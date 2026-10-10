@@ -550,9 +550,15 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         self.av_decay = getattr(config, 'av_decay', 0.8)
         self.use_temporal = getattr(config, 'use_temporal', False)
         self.sparsevlm = getattr(config, 'sparsevlm', False)
-    
+        # Oracle-Act-TopK: keep TopK_k of the current full-token action attention (two forwards per query)
+        self.use_oracle = getattr(config, 'use_oracle', False)
+        self.oracle_layers = getattr(config, 'oracle_layers', None)  # 0-based LLM layers averaged for S_act
+        self.oracle_mode = getattr(config, 'oracle_mode', 'topk')  # "topk" = Oracle A, "depth" = Oracle B
+        self.last_query_info = None
+
     def reset_av_history(self):
         self.av_hist.clear()
+        self.step = None
 
 
     def predict_action(
@@ -563,7 +569,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             input_ids = torch.cat(
                 (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
             )
-        if self.use_fastv or self.sparsevlm:
+        self.last_query_info = None
+        if self.use_oracle:
+            results = self._generate_oracle(input_ids, max_new_tokens=self.get_action_dim(unnorm_key), **kwargs)
+        elif self.use_fastv or self.sparsevlm:
             historical_attention = None
             if self.use_temporal and len(self.av_hist) == self.av_hist.maxlen:
                 if self.step is None:
@@ -610,13 +619,23 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         else:
             results = self.generate(input_ids, max_new_tokens=self.get_action_dim(unnorm_key), **kwargs)
         attentions = results.attentions
-        action_vision_attentions, text_vision_attentions, prefill_attentions = self._extract_action_modality_attentions(attentions, pruning_info=getattr(self.language_model, 'pruning_info', None))
+        # Oracle B has a different visual set per layer, which the single-cut extractor cannot map back; its av_hist
+        # is only needed for the warm start (full-token queries), so the pruned queries skip it.
+        depth_query = self.use_oracle and "visual_depth" in (self.last_query_info or {})
+        if depth_query:
+            action_vision_attentions, text_vision_attentions = None, None
+        else:
+            action_vision_attentions, text_vision_attentions, prefill_attentions = self._extract_action_modality_attentions(attentions, pruning_info=getattr(self.language_model, 'pruning_info', None))
         if action_vision_attentions is not None and action_vision_attentions.numel() > 0:
             layer_idx = 15
             layer_attn = action_vision_attentions[layer_idx]  
             vec = layer_attn.float().mean(dim=0).mean(dim=0).detach().cpu().numpy()
             self.av_hist.append(vec)
-        
+        if (self.use_fastv or self.use_oracle) and not depth_query:
+            if self.last_query_info is None:
+                self.last_query_info = {}
+            self.last_query_info["kept_visual"] = self._kept_visual_indices()
+
         last_caches = {
             "action_vision_attentions": action_vision_attentions,  
             "text_vision_attentions": text_vision_attentions, 
@@ -636,6 +655,204 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
         return actions, last_caches
 
+    # === Oracle-Act-TopK ===
+    def _oracle_fastv_config(
+        self, fastv_r: float, keep_visual: Optional[torch.Tensor], depth: Optional[torch.Tensor] = None
+    ) -> Dict[str, Any]:
+        """
+        Official config for the full pass (fastv_r=0 keeps all tokens); `oracle_keep_visual` selects the direct-TopK
+        prefill (Oracle A), `oracle_depth` the per-token depth prefill (Oracle B).
+        """
+        return {
+            'fastv_k': self.fastv_k,
+            'fastv_r': fastv_r,
+            'image_token_start_index': self.fastv_image_token_start_index,
+            'image_token_length': self.fastv_image_token_length,
+            'historical_attention': None,
+            'use_temporal': True,
+            'use_text_vision_selection': self.use_text_vision_selection,
+            'use_prefil_attention': self.use_prefil_attention,
+            'SparseVLM': False,
+            'oracle_keep_visual': keep_visual,
+            'oracle_depth': depth,
+        }
+
+    def _action_vision_layer_scores(self, attentions: Tuple) -> torch.Tensor:
+        """
+        s[l, m]: mean over heads and the D action-predicting queries of the softmax attention (over the full context,
+        not renormalized to the image) that layer l gives to the KV of visual token m, from an unpruned generate()
+        call. Shape (L, M). attentions[r] is the forward that *predicts* action token r+1: for r = 0 the query is the
+        last prompt position (prefill), for r >= 1 it is the single (previously generated) token fed at that step.
+        """
+        s, e = self.fastv_image_token_start_index, self.fastv_image_token_start_index + self.fastv_image_token_length
+        prompt_len = attentions[0][0].shape[-1]
+        steps = []
+        for r, step_attn in enumerate(attentions):
+            rows = []
+            for l, a in enumerate(step_attn):
+                assert a.shape[-1] == prompt_len + r, f"step {r} layer {l}: key len {a.shape[-1]} != {prompt_len + r} (pruned?)"
+                assert r == 0 or a.shape[-2] == 1, f"decode step {r} should have a single query, got {a.shape[-2]}"
+                rows.append(a[0, :, -1, s:e].float().mean(dim=0))  # (M,)
+            steps.append(torch.stack(rows))  # (L, M)
+        return torch.stack(steps).mean(dim=0)
+
+    def _full_action_vision_score(self, attentions: Tuple, layers: List[int]) -> torch.Tensor:
+        """S_act(m): `_action_vision_layer_scores` averaged over `layers`."""
+        return self._action_vision_layer_scores(attentions)[layers].mean(dim=0)
+
+    def _oracle_budget(self) -> Tuple[int, int]:
+        """(k, B): k visual tokens kept from layer K on, and B = K*M + (L-K)*k, the token-layer budget shared by A and B."""
+        M, K = self.fastv_image_token_length, self.fastv_k
+        L = len(self.language_model.model.layers)
+        k = int(M * (1 - self.fastv_r) + 1e-6)  # floor(rho * M)
+        return k, K * M + (L - K) * k
+
+    def _ema_guide(self) -> Optional[np.ndarray]:
+        """The guide VLA-Pruner would use now (official formula over av_hist); diagnostics only."""
+        if len(self.av_hist) < self.av_hist.maxlen:
+            return None
+        weights = np.array([self.av_decay ** i for i in range(len(self.av_hist))], dtype=np.float32)
+        guided = np.zeros(self.fastv_image_token_length, dtype=np.float32)
+        for i in range(len(weights)):
+            guided += weights[i] * self.av_hist[-1 - i]
+        return guided / np.sum(guided)
+
+    def _kept_visual_indices(self) -> Optional[np.ndarray]:
+        info = getattr(self.language_model, 'pruning_info', None)
+        if info is None or info.get('kept_indices') is None:
+            return None
+        s = self.fastv_image_token_start_index
+        kept = info['kept_indices']
+        kept = kept[(kept >= s) & (kept < s + self.fastv_image_token_length)] - s
+        return kept.cpu().numpy()
+
+    def _generate_oracle(self, input_ids, max_new_tokens: int, **kwargs):
+        """
+        During the warm start (first w queries, same as VLA-Pruner) one full-token pass is executed. Afterwards:
+        (1) full-token generate on the same input -> per-layer scores s (L, M) (its action is discarded);
+        (2) generate again from a fresh prefill with the oracle selection, and execute that action.
+          topk  (Oracle A): keep exactly TopK_k(mean_{l in oracle_layers} s[l]) from layer K on (no semantic, no MMDP).
+          depth (Oracle B): per-token depth d maximizing sum_i sum_{l<d_i} s[l, i] s.t. sum_i d_i = K*M + (L-K)*k.
+          schedule (Oracle B-fixed): fixed per-layer counts n_l (sum = same budget); tokens ranked by
+            r_i = sum_{l >= m} s[l, i] (m = number of leading full layers) get depth_i = #{l : n_l > rank_i}.
+        """
+        from .oracle_llama import install_oracle_prefill, oracle_depth_dp, oracle_topk
+
+        install_oracle_prefill(self.language_model.model)
+        warm = len(self.av_hist) < self.av_hist.maxlen
+        if self.oracle_mode == "predictor" and not warm:
+            # Learned ranker inside a single prefill: no teacher pass, no DP
+            pred = self.oracle_predictor
+            info = {"warm": False, "visual_depth": None}
+            if getattr(self, "oracle_log_teacher", False):
+                # diagnostics only: dense teacher pass on the same input, logged next to the predictor's choice
+                self.fastv_config = self._oracle_fastv_config(0.0, None)
+                full = self.generate(input_ids, max_new_tokens=max_new_tokens, **kwargs)
+                info["s_layer"] = self._action_vision_layer_scores(full.attentions).cpu().numpy().astype(np.float16)
+                a, b = self.oracle_instr_span
+                S0, Mv = self.fastv_image_token_start_index, self.fastv_image_token_length
+                q = torch.arange(Mv + a, Mv + b)
+                info["s_instr"] = torch.stack([att[0, :, q, S0:S0 + Mv].float().mean(dim=(0, 1))
+                                               for att in full.attentions[0]]).cpu().numpy().astype(np.float16)
+                # per instruction word: head mean, summed over layers >= predictor layer -> (n_words, M)
+                info["s_instr_tok"] = torch.stack([att[0, :, q, S0:S0 + Mv].float().mean(dim=0)
+                                                   for att in full.attentions[0][pred.layer:]]).sum(0).cpu().numpy()
+                info["instr_ids"] = input_ids[0, a:b].cpu().numpy()
+                info["full_action_ids"] = full.sequences[0, -max_new_tokens:].cpu().numpy()
+                del full
+            self.fastv_config = self._oracle_fastv_config(self.fastv_r, None)
+            self.fastv_config.update({'oracle_depth_fn': pred, 'oracle_depth_fn_layer': pred.layer})
+            self.last_query_info = info  # before generate so predict_action sees the depth query
+            results = self.generate(input_ids, max_new_tokens=max_new_tokens, **kwargs)
+            pinfo = self.language_model.model.pruning_info
+            info["visual_depth"] = pinfo["visual_depth"].cpu().numpy()
+            info["layer_visual_counts"] = np.array(pinfo["layer_visual_counts"])
+            return results
+        self.fastv_config = self._oracle_fastv_config(0.0, None)
+        full = self.generate(input_ids, max_new_tokens=max_new_tokens, **kwargs)
+        if warm:
+            self.last_query_info = {"warm": True}
+            return full
+
+        k, budget = self._oracle_budget()
+        s_layer = self._action_vision_layer_scores(full.attentions)  # (L, M)
+        info = {
+            "warm": False,
+            "s_layer": s_layer.cpu().numpy().astype(np.float16),
+            "s_act_l15": s_layer[15].cpu().numpy(),
+            "full_action_ids": full.sequences[0, -max_new_tokens:].cpu().numpy(),
+        }
+        # Instruction grounding: prefill attention of the instruction tokens to the visual KV, per layer (L, M)
+        mix = float(getattr(self, "oracle_label_mix", 0.0))
+        s_instr = None
+        if mix > 0:
+            a, b = self.oracle_instr_span  # instruction token range in input_ids; input token j sits at sequence M + j
+            S0, Mv = self.fastv_image_token_start_index, self.fastv_image_token_length
+            q = torch.arange(Mv + a, Mv + b)
+            s_instr = torch.stack([att[0, :, q, S0:S0 + Mv].float().mean(dim=(0, 1)) for att in full.attentions[0]]).cpu()
+        del full
+
+        if self.oracle_mode == "topk":
+            s_act = s_layer[self.oracle_layers].mean(dim=0)
+            keep = oracle_topk(s_act, k)
+            ema = self._ema_guide()
+            info.update({
+                "s_act": s_act.cpu().numpy(),
+                "topk_act": keep.cpu().numpy(),
+                "topk_ema": None if ema is None else np.sort(np.argsort(-ema, kind="stable")[:k]),
+            })
+            self.fastv_config = self._oracle_fastv_config(self.fastv_r, keep)
+        elif self.oracle_mode == "depth":
+            min_depth = int(getattr(self, "oracle_min_depth", 0))
+            s_dp = s_layer
+            if s_instr is not None:
+                # per-layer mixed score: each source normalized by its mass over layers >= min_depth
+                sa, si = s_layer.double().cpu(), s_instr.double()
+                s_dp = (1 - mix) * sa / sa[min_depth:].sum() + mix * si / si[min_depth:].sum()
+                info["s_instr"] = s_instr.numpy().astype(np.float16)
+            depth, objective = oracle_depth_dp(s_dp, budget, min_depth)
+            # Same scores under the Oracle A mask (TopK_k of layers K..L-1 kept to the end): the DP's lower bound
+            # whenever the A mask is feasible (min_depth <= K)
+            K, L = self.fastv_k, s_layer.shape[0]
+            topk_a = oracle_topk(s_layer[K:].sum(dim=0), k)
+            objective_a = float(s_layer[:K].sum() + s_layer[K:, topk_a].sum())
+            if min_depth <= K and s_instr is None:
+                assert objective >= objective_a - 1e-6, f"DP objective {objective} < Oracle A objective {objective_a}"
+            info.update({
+                "visual_depth": depth.numpy(),
+                "layer_visual_counts": (depth[None, :] > torch.arange(L)[:, None]).sum(dim=1).numpy(),
+                "objective": np.array([objective, objective_a]),
+            })
+            self.fastv_config = self._oracle_fastv_config(self.fastv_r, None, depth=depth)
+        elif self.oracle_mode == "schedule":
+            from .oracle_llama import oracle_schedule_depth
+            L, M = s_layer.shape
+            n_l = torch.tensor(self.oracle_schedule, dtype=torch.long)
+            assert len(n_l) == L and int(n_l.sum()) == budget, f"schedule sum {int(n_l.sum())} != budget {budget}"
+            depth, m = oracle_schedule_depth(s_layer, n_l)
+            if s_instr is not None:
+                # mixed ranking: (1 - mix) * action share + mix * instruction share, each over layers >= m
+                r_act = s_layer[m:].sum(dim=0).double().cpu()
+                r_ins = s_instr[m:].sum(dim=0).double()
+                score = (1 - mix) * r_act / r_act.sum() + mix * r_ins / r_ins.sum()
+                order = torch.sort(-score, stable=True).indices
+                rank = torch.empty(M, dtype=torch.long)
+                rank[order] = torch.arange(M)
+                depth = (n_l[None, :] > rank[:, None]).sum(dim=1)
+                info["r_instr"] = r_ins.float().numpy()
+            objective = float(sum(s_layer[: int(depth[i]), i].sum() for i in range(M)))
+            _, objective_dp = oracle_depth_dp(s_layer, budget, m)  # diagnostics: same scores, free counts
+            info.update({
+                "visual_depth": depth.numpy(),
+                "layer_visual_counts": (depth[None, :] > torch.arange(L)[:, None]).sum(dim=1).numpy(),
+                "objective": np.array([objective, objective_dp]),
+            })
+            self.fastv_config = self._oracle_fastv_config(self.fastv_r, None, depth=depth)
+        else:
+            raise ValueError(f"unknown oracle_mode {self.oracle_mode!r}")
+        self.last_query_info = info  # set before generate so predict_action sees the depth query
+        results = self.generate(input_ids, max_new_tokens=max_new_tokens, **kwargs)
+        return results
 
     def _extract_action_modality_attentions(self, attentions: List[Tuple], pruning_info: Optional[Dict] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """

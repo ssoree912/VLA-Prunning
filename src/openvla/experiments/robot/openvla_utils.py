@@ -313,6 +313,20 @@ def get_vla(cfg):
         vla.av_hist = deque(maxlen=vla.config.av_hist_w)
         vla.use_temporal = vla.config.use_temporal
 
+    if getattr(cfg, 'use_oracle', False):
+        # use_fastv routes the prefill through fastv_forward; use_temporal gives the same w-query full-token warm start
+        assert cfg.use_fastv and use_temporal, "Oracle-Act-TopK needs use_fastv and use_temporal (warm start)"
+        vla.use_oracle = True
+        vla.oracle_layers = cfg.oracle_layer_ids
+        vla.oracle_mode = cfg.oracle_mode
+        vla.oracle_min_depth = cfg.oracle_min_depth
+        vla.oracle_schedule = getattr(cfg, "oracle_schedule_n_l", None)
+        vla.oracle_label_mix = float(getattr(cfg, "oracle_label_mix", 0.0))
+        vla.oracle_log_teacher = bool(getattr(cfg, "oracle_log_teacher", False))
+        if cfg.oracle_mode == "predictor":
+            from prismatic.extern.hf.oracle_predictor import TokenDepthPredictor
+            vla.oracle_predictor = TokenDepthPredictor(cfg.oracle_predictor_ckpt, DEVICE)
+
 
     # Move model to device.
     # Note: `.to()` is not supported for 8-bit or 4-bit bitsandbytes models, but the model will
@@ -456,6 +470,11 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     # Process inputs
     inputs = processor(prompt, image).to(DEVICE, dtype=torch.bfloat16)
 
+    if getattr(vla, "use_oracle", False):
+        # instruction token range in input_ids (for oracle labels that mix in instruction->vision attention)
+        pre = "In: What action should the robot take to"
+        tok = processor.tokenizer
+        vla.oracle_instr_span = (len(tok(pre).input_ids), len(tok(f"{pre} {task_label.lower()}").input_ids))
     action, last_caches = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False, return_dict_in_generate=True, 
                                                         output_attentions = True, past_key_values=prompt_cache)
     return action, last_caches, result_image
