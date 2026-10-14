@@ -2,22 +2,30 @@
 __pycache__/
 *.pyc
 *.egg-info/
+.ipynb_checkpoints/
 
-# Model checkpoints (symlinks / downloads)
+# Checkpoints, data and run outputs (paths in gazeprune/paths.py and scripts/common.sh point outside the repo)
+checkpoints/
 src/openvla/checkpoints
 src/openvla-oft/checkpoints
-checkpoints/
-
-# Evaluation results and logs
+data/
+models/
+eval_logs/
+logs/
+results/
+rollouts/
+rollouts_dev/
+wandb/
 src/openvla/experiments/logs/
 src/openvla-oft/experiments/logs/
-src/openvla/rollouts_dev/
-rollouts/
-wandb/
+
+# Run artifacts
 *.log
 *.out
+*.partial
 *.jsonl
 *.npz
 *.npy
 *.mp4
 *.pt
+status.txt

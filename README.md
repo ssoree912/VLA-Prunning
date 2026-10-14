@@ -1,142 +1,59 @@
-# <div align="center">Bridging the Semantic-Action Gap in Visual Token Pruning for Efficient VLA Inference (VLA-Pruner)</div>
+# GazePrune
 
-<div align="center">
+Per-token depth pruning of the visual tokens of vision-language-action models, driven by **where the action queries
+look**. A small ranker reads the hidden states at the input of layer 2 and orders the visual tokens; a fixed per-layer
+schedule — obtained from an exact depth oracle on teacher attention labels — decides how many tokens each layer keeps.
+One forward per query, no teacher pass at inference, no per-layer host–GPU synchronization.
 
-[![arXiv](https://img.shields.io/badge/Paper-Arxiv-red)](https://arxiv.org/pdf/2511.16449v5)
-[![Hugging Face](https://img.shields.io/badge/Hugging%20Face-Paper-yellow?logo=huggingface)](https://huggingface.co/papers/2511.16449)
-[![License](https://img.shields.io/badge/License-MIT-g.svg)](LICENSE)
+Models: [OpenVLA-OFT](https://github.com/moojink/openvla-oft) (LIBERO checkpoints) and base OpenVLA.
+Built on the [VLA-Pruner](https://github.com/MINT-SJTU/VLA-Pruner) code base (kept under `src/`).
 
-**Ziyan Liu, Yeqiu Chen, Yiming Zhang, Hongyi Cai, Tao Lin, Runquan Gui, Shuo Yang, Zheng Liu, Bo Zhao**
+## Layout
 
-</div>
-
-<div align="center">
-VLA-Pruner is a training-free, plug-and-play visual token pruning method for efficient VLA inference. It bridges the semantic-action gap by combining semantic importance from vision-language prefilling with temporally smoothed action relevance from recent action decoding.
-</div>
-
----
-
-## 📌 News
-
-🔥 **[2025/02/06]**: Code for OpenVLA is available ([OpenVLA README](src/openvla/README_VLA_Pruner.md)).
-
-🔥 **[2026/05/25]**: Code for OpenVLA-OFT is available ([OpenVLA-OFT README](src/openvla-oft/README_VLA_Pruner.md)).
-
-📝 **[2026/05/26]**: The latest revision of our paper is available ([v0.2](https://arxiv.org/abs/2511.16449v5)); see the previous version here ([v0.1](https://arxiv.org/abs/2511.16449v3)).
-
----
-
-## 🎯 Overview
-
-Vision-Language-Action (VLA) models integrate visual perception, language understanding, and action execution, but their real-time deployment requires processing continuous visual streams, leading to substantial computational overhead. Visual token pruning, which has been widely used to accelerate VLMs, offers a natural solution by retaining salient tokens and discarding redundant ones. However, directly applying VLM-oriented pruning methods to VLA inference can severely degrade manipulation performance.
-
-Our analysis attributes this degradation to a key mismatch between semantic salience and action relevance. VLA inference exhibits distinct attention patterns between the vision-language prefill stage and the action-decode stage. Pruning based only on context-prefill semantic salience is therefore biased toward semantic cues and may remove action-critical visual tokens. The following observation illustrates this semantic-action mismatch across inference stages.
-
-<p align='center'>
-<img src='./assert/observation-v4.png' alt='Semantic-action mismatch in VLA inference' width='800px'>
-<br>
-<em>Observation: semantic salience during prefilling does not fully align with action relevance during decoding.</em>
-</p>
-
-To address this issue, we propose VLA-Pruner, an effective plug-and-play token pruning method tailored to the visual requirements of VLA inference. VLA-Pruner estimates visual-token importance from both semantic prefilling and temporally smoothed action relevance. It then applies a Combine-then-Filter strategy: first combining tokens important to either semantic understanding or action decoding, and then filtering redundant candidates under the target compute budget.
-
-<p align='center'>
-<img src='./assert/framework-v4.png' alt='Framework of VLA-Pruner' width='400px'>
-<br>
-<em>Framework: semantic-action importance estimation followed by Combine-then-Filter token selection.</em>
-</p>
-
-By bridging semantic salience and action relevance, VLA-Pruner reduces inference cost while preserving the visual information needed for both semantic understanding and action execution.
-
----
-
-## 🛠️ Installation
-
-### 1. Clone the repository
-```bash
-git clone https://github.com/MINT-SJTU/VLA-Pruner.git
-cd VLA-Pruner
+```text
+VLA-Prunning/
+├── gazeprune/       library: ranker, oracle depth DP + schedules, predictor, official-OFT depth forward, paths
+├── teacher/         teacher labels + ranker features from the LIBERO RLDS demos (OFT)
+├── train/           ranker training (budget-free) and per-budget schedules
+├── eval/            eval entry points (ours / Full on the official OFT stack, baseline wrappers) + shared profiler
+├── analysis/        latency breakdown, port verification
+├── tools/           label maintenance (drop arrays, truncate PCA features)
+├── scripts/         common.sh, label.sh, train.sh, eval.sh, latency.sh, gpu_slots.sh
+├── patches/         local edits to the baseline repos (official OFT, SpecPrune, VLA-Cache)
+├── docs/            method.md (labels / features / training / inference), benchmark.md (measurement protocol)
+└── src/             VLA-Pruner code: openvla/ (base OpenVLA + GazePrune integration, oracle_scripts/), openvla-oft/
 ```
 
-### 2. Set up environments
-Follow the [OpenVLA](src/openvla/README.md) setup instructions.
+Checkpoints, labels, predictors and logs are not tracked. `scripts/common.sh` and `gazeprune/paths.py` read
+`GAZEPRUNE_ROOT` (default `/workspace/vla`), `GAZEPRUNE_DATA`, `GAZEPRUNE_MODELS`, `GAZEPRUNE_LOGS` and
+`GAZEPRUNE_BASELINES`.
+
+## Setup (OpenVLA-OFT)
+
+- Environment: the OpenVLA-OFT conda env (`openvla-oft`) with LIBERO.
+- Official stack, added through `PYTHONPATH` only: the official OFT repo (`$GAZEPRUNE_BASELINES/openvla-oft-official`)
+  and the transformers fork `v4.40.1-openvla-oft` + tokenizers 0.19 (`_transformers_oft/src`, `_pydeps_oft`).
+- Baselines (same location): `SpecPrune-VLA`, `vla-cache` (+ its transformers branch `vla-cache-openvla-oft`),
+  VLA-Pruner's `src/openvla-oft`. Apply `patches/*.patch` to them.
+- One checkpoint copy per method (`$GAZEPRUNE_MODELS/oft-<method>/<ckpt>-<method>`, weights symlinked): `get_vla`
+  rewrites files inside the checkpoint dir and HF caches remote code by the dir name.
+
+## Pipeline (OpenVLA-OFT)
 
 ```bash
-conda activate openvla
-cd src/openvla
-pip install -e .
+bash scripts/label.sh 0 libero_spatial            # teacher labels + features (official OFT stack)
+bash scripts/train.sh 0 libero_spatial 0.35       # two-head ranker (no avis, PCA 256) + w=0.35 schedule at 20%
+bash scripts/eval.sh 0 ours libero_spatial        # 500 episodes (50 init states x 10 tasks), seed 7
+bash scripts/eval.sh 0 full libero_spatial        # baselines: full | specprune | specprune_nodyn | vlapruner | vlacache
+bash scripts/latency.sh 0                         # clean per-query latency / FLOPs / memory of every method
 ```
 
----
+Default GazePrune setting: two-head ranker (action / instruction heads), inputs = layer-1 visual hidden (PCA 256),
+action-query summary, patch position; head weight w = 0.35; 20 % visual token-layer budget (3280 of 32 x 512).
+See `docs/method.md` for the formulas and `docs/benchmark.md` for the measurement protocol.
 
-## 🚀 VLA-Pruner Evaluation
+## Base OpenVLA
 
-### 🔧 OpenVLA Evaluation
-
-#### ✅ Download pretrained checkpoint:
-```bash
-conda activate openvla
-cd src/openvla
-python vla_pruner_srcipts/download_model_local.py \
-  --model_id openvla/openvla-7b-finetuned-libero-spatial
-```
-
-#### ▶️ Run evaluation with VLA-Pruner:
-```bash
-CUDA_VISIBLE_DEVICES=0 python experiments/robot/libero/run_libero_eval.py \
-    --pretrained_checkpoint checkpoints/openvla-7b-finetuned-libero-spatial \
-    --task_suite_name libero_spatial \
-    --use_fastv True \
-    --use_prefil_attention True \
-    --use_temporal True \
-    --fastv_r 0.75 \
-    --num_trials_per_task 50
-```
-
-#### ⚡ Run evaluation with FastV:
-```bash
-CUDA_VISIBLE_DEVICES=0 python experiments/robot/libero/run_libero_eval.py \
-    --pretrained_checkpoint checkpoints/openvla-7b-finetuned-libero-spatial \
-    --task_suite_name libero_spatial \
-    --use_fastv True \
-    --use_temporal False \
-    --fastv_r 0.75 \
-    --num_trials_per_task 50
-```
-
-#### Run OpenVLA baseline (without VLA-Pruner):
-```bash
-CUDA_VISIBLE_DEVICES=0 python experiments/robot/libero/run_libero_eval.py \
-    --pretrained_checkpoint checkpoints/openvla-7b-finetuned-libero-spatial \
-    --task_suite_name libero_spatial \
-    --use_fastv False \
-    --num_trials_per_task 50
-```
-
-For more evaluation scripts and detailed instructions, see [OpenVLA README](src/openvla/README_VLA_Pruner.md).
-
----
-
-## 📖 Citation
-
-If you find this work useful, please cite:
-```bibtex
-@article{liu2025vla,
-  title={VLA-Pruner: Temporal-Aware Dual-Level Visual Token Pruning for Efficient Vision-Language-Action Inference},
-  author={Liu, Ziyan and Chen, Yeqiu and Cai, Hongyi and Lin, Tao and Yang, Shuo and Liu, Zheng and Zhao, Bo},
-  journal={arXiv preprint arXiv:2511.16449},
-  year={2025}
-}
-```
-
----
-
-## 🤝 Acknowledgements
-
-We build on the amazing work of [OpenVLA](https://github.com/openvla/openvla) and [Huggingface Transformers](https://github.com/huggingface/transformers).
-
----
-
-## 📜 License
-
-This project is licensed under the [MIT License](LICENSE).
+The base-OpenVLA integration lives in `src/openvla` (`prismatic/extern/hf/oracle_predictor.py`, `oracle_llama.py`,
+`experiments/robot/libero/run_libero_eval.py`) with its scripts in `src/openvla/oracle_scripts/` (labels, features,
+two-head training with `--drop avis ains --pca_dim 256`, schedules, 500-episode launcher `std500_p20.sh`).
