@@ -5,7 +5,8 @@ run_eval.py -- the upstream OpenVLA-OFT LIBERO eval (experiments/robot/libero/ru
     (first w queries with full tokens) and the token metadata are identical to VLA-Pruner; every pruned query runs
     the depth forward instead of the VLA-Pruner single cut.
 
-Env:  OFT_RESULTS_JSONL (required), OFT_METHOD (label), OFT_PREDICTOR_CKPT (optional)
+Env:  OFT_RESULTS_JSONL (required), OFT_METHOD (label), OFT_PREDICTOR_CKPT (optional),
+      OFT_TASK_IDS / OFT_INIT_OFFSET (optional task subset and first initial state)
 Args: forwarded to the upstream draccus config, e.g.
     CUDA_VISIBLE_DEVICES=3 OFT_RESULTS_JSONL=... OFT_METHOD=pruner python oft_oracle/run_eval.py \
         --pretrained_checkpoint <ckpt> --task_suite_name libero_spatial --use_vla_cache False --use_vla_pruner True \
@@ -47,9 +48,30 @@ def initialize_model(cfg):
 _run_task = R.run_task
 
 
+TASK_IDS = os.environ.get("OFT_TASK_IDS")  # e.g. "0,1,2,3,4": run only these tasks (sharding)
+INIT_OFFSET = int(os.environ.get("OFT_INIT_OFFSET", "0"))  # first LIBERO initial state (episodes use offset + k)
+
+
+class _OffsetSuite:
+    """Task suite view whose init states start at INIT_OFFSET (so episode k uses initial state INIT_OFFSET + k)."""
+
+    def __init__(self, suite):
+        self._suite = suite
+
+    def __getattr__(self, name):
+        return getattr(self._suite, name)
+
+    def get_task_init_states(self, task_id):
+        return self._suite.get_task_init_states(task_id)[INIT_OFFSET:]
+
+
 def run_task(cfg, task_suite, task_id, *args, **kwargs):
-    state["task_id"], state["episode"] = task_id, 0
-    return _run_task(cfg, task_suite, task_id, *args, **kwargs)
+    if TASK_IDS and str(task_id) not in TASK_IDS.split(","):
+        # eval_libero passes (model, resize_size, processor, action_head, proprio_projector, noisy_action_projector,
+        # total_episodes, total_successes, log_file) positionally: hand the running totals back unchanged
+        return (args[6], args[7]) if len(args) >= 8 else (kwargs.get("total_episodes", 0), kwargs.get("total_successes", 0))
+    state["task_id"], state["episode"] = task_id, INIT_OFFSET
+    return _run_task(cfg, _OffsetSuite(task_suite) if INIT_OFFSET else task_suite, task_id, *args, **kwargs)
 
 
 _run_episode = R.run_episode

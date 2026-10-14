@@ -68,7 +68,8 @@ def main():
         n[j] += 1
     n = np.sort(n)[::-1]
     assert n.sum() == budget and (n[:m] == M).all()
-    out = Path(__file__).parent / "schedules" / f"{args.suite}_m{m}_w{args.w:g}.json"
+    suffix = "" if budget == 1696 else f"_b{budget}"
+    out = Path(__file__).parent / "schedules" / f"{args.suite}_m{m}_w{args.w:g}{suffix}.json"
     meta = {"n_l": n.tolist(), "budget": int(budget), "min_depth": m, "w": args.w, "suite": args.suite,
             "n_frames": int(len(idx)), "count_std_mean": float(counts.std(0)[m:].mean())}
     json.dump(meta, open(out, "w"), indent=1)

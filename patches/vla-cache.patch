@@ -1,0 +1,29 @@
+diff --git a/src/openvla-oft/prismatic/models/action_heads.py b/src/openvla-oft/prismatic/models/action_heads.py
+index 0f5d63b..7b4a13d 100644
+--- a/src/openvla-oft/prismatic/models/action_heads.py
++++ b/src/openvla-oft/prismatic/models/action_heads.py
+@@ -5,7 +5,10 @@ import math
+ import numpy as np
+ import torch
+ import torch.nn as nn
+-from diffusers.schedulers.scheduling_ddim import DDIMScheduler
++try:  # local edit: diffusers in the shared env needs peft>=0.17 (only used by the diffusion head, not L1 regression)
++    from diffusers.schedulers.scheduling_ddim import DDIMScheduler
++except ImportError:
++    DDIMScheduler = None
+ from prismatic.vla.constants import ACTION_DIM, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, STOP_INDEX
+ 
+ 
+diff --git a/src/openvla/experiments/robot/libero/libero_utils.py b/src/openvla/experiments/robot/libero/libero_utils.py
+index 70a5d70..cf8a1b6 100644
+--- a/src/openvla/experiments/robot/libero/libero_utils.py
++++ b/src/openvla/experiments/robot/libero/libero_utils.py
+@@ -66,7 +66,7 @@ def save_rollout_video(rollout_images, idx, success, task_description, log_file=
+     mp4_path = f"{rollout_dir}/{DATE_TIME}--episode={idx}--success={success}--task={processed_task_description}.mp4"
+     video_writer = imageio.get_writer(mp4_path, fps=30)
+     for img in rollout_images:
+-        video_writer.append_data(img)
++        video_writer.append_data(np.asarray(img))
+     video_writer.close()
+     print(f"Saved rollout MP4 at path {mp4_path}")
+     if log_file is not None:

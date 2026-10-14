@@ -33,7 +33,9 @@ run_method() {
     oracle_bfix) margs="$PRUNER_ARGS --use_oracle True --oracle_mode schedule --oracle_schedule ${SCHEDULE:-oracle_scripts/schedules/${SUITE}_m2.json}" ;;
     oracle_b_m*) margs="$PRUNER_ARGS --use_oracle True --oracle_mode depth --oracle_min_depth ${method#oracle_b_m}" ;;
   esac
-  CUDA_VISIBLE_DEVICES=$gpu $PY experiments/robot/libero/run_libero_eval.py \
+  # PROF_OUT=<file.prof.jsonl>: wrap with the shared per-query FLOPs/latency profiler (baselines/tools/vla_profile.py)
+  local prof=${PROF_OUT:+/workspace/vla/baselines/tools/vla_profile.py $PROF_OUT}
+  CUDA_VISIBLE_DEVICES=$gpu $PY $prof experiments/robot/libero/run_libero_eval.py \
     --pretrained_checkpoint $CKPT --task_suite_name $SUITE --seed $SEED \
     --local_log_dir $LOG_DIR --run_id_note "${tag}_${method}" $margs "$@"
 }

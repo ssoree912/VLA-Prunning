@@ -42,7 +42,9 @@ def round_schedule(mean_counts, budget):
     return np.sort(n)[::-1]
 
 
-def load(files, suite):
+def load(files, suite, drop=(), pca_dim=None):
+    """drop: attention features not read ("avis", "ains"; they may be absent from the files) -> dummy (N, 1, 1).
+    pca_dim: keep the first pca_dim PCA coordinates of hv (stored sorted by explained variance)."""
     out = defaultdict(list)
     for f in files:
         name = Path(f).name
@@ -50,10 +52,18 @@ def load(files, suite):
         la = np.load(f"/workspace/vla/data/oracle_labels/{suite}/{name}")
         ins = np.load(f"/workspace/vla/data/oracle_instr_labels/{suite}/{name}")
         assert len(fe["r"]) == len(ins["hins"]) == len(la["s_layer"])
-        out["hv"].append(fe["hv"]); out["hlast"].append(fe["hlast"]); out["avis"].append(fe["avis"])
-        out["hins"].append(ins["hins"]); out["ains"].append(ins["ains"])
+        out["hv"].append(fe["hv"][..., :pca_dim] if pca_dim else fe["hv"]); out["hlast"].append(fe["hlast"])
+        if "avis" not in drop:
+            out["avis"].append(fe["avis"])
+        out["hins"].append(ins["hins"])
+        if "ains" not in drop:
+            out["ains"].append(ins["ains"])
         out["s_act"].append(la["s_layer"]); out["s_instr"].append(ins["s_instr"])
-    return {k: torch.from_numpy(np.concatenate(v)) for k, v in out.items()}
+    res = {k: torch.from_numpy(np.concatenate(v)) for k, v in out.items()}
+    for k in ("avis", "ains"):
+        if k in drop:
+            res[k] = torch.zeros(len(res["hv"]), 1, 1, dtype=torch.float16)
+    return res
 
 
 def mixed(s_act, s_ins, mix, m):
@@ -96,6 +106,8 @@ def main():
     p.add_argument("--out_tag", default="", help="suffix of the output folder (keeps earlier checkpoints)")
     p.add_argument("--two_head", action="store_true", help="separate action / instruction heads, mixed at inference")
     p.add_argument("--head_weights", nargs="+", type=float, default=[0.3, 0.4, 0.5, 0.6])
+    p.add_argument("--drop", nargs="*", default=[], choices=["avis", "ains"], help="attention inputs left out (as OFT)")
+    p.add_argument("--pca_dim", type=int, default=None, help="use the first k PCA coordinates of hv")
     args = p.parse_args()
     dev, m = "cuda", args.min_depth
     out_root = Path(f"/workspace/vla/data/oracle_predictor_mix/{args.suite}_m{m}_mix{args.mix:g}_s{args.seed}{args.out_tag}")
@@ -112,7 +124,7 @@ def main():
         n_val = max(1, round(args.val_frac * len(fs)))
         va_f += fs[:n_val]; tr_f += fs[n_val:]
     t0 = time.time()
-    tr, va = load(tr_f, args.suite), load(va_f, args.suite)
+    tr, va = load(tr_f, args.suite, args.drop, args.pca_dim), load(va_f, args.suite, args.drop, args.pca_dim)
     for d in (tr, va):
         d["s_mix"], d["r"] = mixed(d["s_act"], d["s_instr"], args.mix, m)
         d["r_act"] = d["s_act"][:, m:].float().sum(1)
@@ -162,8 +174,11 @@ def main():
                 "instr_only_recall": float((tp & instr_only).sum() / instr_only.sum().clamp_min(1)),
                 "obj_vs_teacher": float((objective(s_va, depth_from_scores(score, n_l)) / obj_teacher).mean())}
 
-    base = {"action_rank (r_act)": metrics(ra_va), "attn_last (avis)": metrics(va["avis"].to(dev).float().mean(1)),
-            "attn_instr (ains)": metrics(va["ains"].to(dev).float().mean(1))}
+    base = {"action_rank (r_act)": metrics(ra_va)}
+    if "avis" not in args.drop:
+        base["attn_last (avis)"] = metrics(va["avis"].to(dev).float().mean(1))
+    if "ains" not in args.drop:
+        base["attn_instr (ains)"] = metrics(va["ains"].to(dev).float().mean(1))
     print(f"instruction-only tokens per frame: {float(instr_only.sum(1).float().mean()):.2f} of {n2}", flush=True)
     for kk, v in base.items():
         print(f"  baseline {kk:22s} {json.dumps({a: round(b, 4) for a, b in v.items()})}", flush=True)
@@ -188,7 +203,7 @@ def main():
         use_last, use_hins, use_ains = VARIANTS[var]
         torch.manual_seed(args.seed)
         model = DepthRanker(pca_dim=tr["hv"].shape[-1], dropout=args.dropout, use_last=use_last,
-                            use_instr=use_hins or use_ains, n_out=2 if args.two_head else 1).to(dev)
+                            use_instr=use_hins or use_ains, n_out=2 if args.two_head else 1, drop=args.drop).to(dev)
         if var == "B":  # instruction attention only: zero the instruction hidden summary
             for d in (tr, va):
                 d.setdefault("hins_backup", d["hins"]); d["hins"] = torch.zeros_like(d["hins_backup"])

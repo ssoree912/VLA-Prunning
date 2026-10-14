@@ -63,15 +63,20 @@ def load_split(suite, val_frac, seed):
     return train, val
 
 
-def load(files, suite, with_s):
+def load(files, suite, with_s, use_avis=True, pca_dim=None):
+    """use_avis=False: avis is not read (it may be absent from the feature files); a dummy (N, 1, 1) is returned.
+    pca_dim: keep the first pca_dim PCA coordinates of hv (stored sorted by explained variance)."""
     out = defaultdict(list)
     for f in files:
         d = np.load(f)
-        for k in ("hv", "hlast", "avis", "r"):
-            out[k].append(d[k])
+        for k in ("hv", "hlast", "r") + (("avis",) if use_avis else ()):
+            out[k].append(d[k][..., :pca_dim] if (k == "hv" and pca_dim) else d[k])
         if with_s:
             out["s"].append(np.load(f"/workspace/vla/data/oracle_labels/{suite}/{Path(f).name}")["s_layer"])
-    return {k: torch.from_numpy(np.concatenate(v)) for k, v in out.items()}
+    res = {k: torch.from_numpy(np.concatenate(v)) for k, v in out.items()}
+    if not use_avis:
+        res["avis"] = torch.zeros(len(res["r"]), 1, 1, dtype=torch.float16)
+    return res
 
 
 @torch.no_grad()
@@ -84,9 +89,10 @@ def evaluate(model, data, n_l, budget, min_depth, dev, dp_frames):
     scores = {
         "predictor": logits,
         "teacher_rank": r,                                              # Oracle B-fixed (upper bound for ranking)
-        "attn_l01": data["avis"].to(dev).float().mean(1),               # no training: layer 0-1 last-token attention
         "mean_target": (r / r.sum(1, keepdim=True)).mean(0, keepdim=True).expand_as(r),  # no image information
     }
+    if data["avis"].shape[-1] == r.shape[1]:  # no training: layer 0-1 last-token attention (when avis is loaded)
+        scores["attn_l01"] = data["avis"].to(dev).float().mean(1)
     obj = {k: objective(s, depth_from_scores(v, n_l)) for k, v in scores.items()}
     n2 = int(n_l[min_depth])
     top_true = torch.zeros_like(r, dtype=torch.bool).scatter_(1, r.topk(n2, dim=1).indices, True)
@@ -119,6 +125,8 @@ def main():
     parser.add_argument("--dp_frames", type=int, default=500)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out_dir", default=None)
+    parser.add_argument("--drop", nargs="*", default=[], choices=["avis"], help="inputs left out (as the OFT ranker)")
+    parser.add_argument("--pca_dim", type=int, default=None, help="use the first k PCA coordinates of hv")
     args = parser.parse_args()
     torch.manual_seed(args.seed)
     dev = "cuda"
@@ -133,11 +141,13 @@ def main():
         rng = np.random.default_rng(args.seed + 1)
         train_files = sorted(rng.choice(train_files, round(args.train_frac * len(train_files)), replace=False))
     t0 = time.time()
-    tr, va = load(train_files, args.suite, with_s=False), load(val_files, args.suite, with_s=True)
+    ua = "avis" not in args.drop
+    tr = load(train_files, args.suite, with_s=False, use_avis=ua, pca_dim=args.pca_dim)
+    va = load(val_files, args.suite, with_s=True, use_avis=ua, pca_dim=args.pca_dim)
     print(f"train {len(train_files)} demos / {len(tr['r'])} frames, val {len(val_files)} demos / {len(va['r'])} "
           f"frames, loaded in {time.time() - t0:.0f}s", flush=True)
 
-    model = DepthRanker(pca_dim=tr["hv"].shape[-1], dropout=args.dropout).to(dev)
+    model = DepthRanker(pca_dim=tr["hv"].shape[-1], dropout=args.dropout, drop=args.drop).to(dev)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"params {n_params / 1e6:.2f}M", flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

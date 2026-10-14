@@ -1,0 +1,16 @@
+diff --git a/prismatic/models/action_heads.py b/prismatic/models/action_heads.py
+index 0f5d63b..7b4a13d 100644
+--- a/prismatic/models/action_heads.py
++++ b/prismatic/models/action_heads.py
+@@ -5,7 +5,10 @@ import math
+ import numpy as np
+ import torch
+ import torch.nn as nn
+-from diffusers.schedulers.scheduling_ddim import DDIMScheduler
++try:  # local edit: diffusers in the shared env needs peft>=0.17 (only used by the diffusion head, not L1 regression)
++    from diffusers.schedulers.scheduling_ddim import DDIMScheduler
++except ImportError:
++    DDIMScheduler = None
+ from prismatic.vla.constants import ACTION_DIM, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, STOP_INDEX
+ 
+ 

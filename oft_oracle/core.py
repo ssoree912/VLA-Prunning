@@ -14,6 +14,8 @@ Contents
                                              (fastv_r == 0) use the official path, others the depth forward
 """
 
+import json
+import os
 import types
 from pathlib import Path
 
@@ -60,26 +62,43 @@ def round_schedule(mean_counts, budget):
 class DepthRanker(nn.Module):
     """Per-token MLP over [visual hidden (PCA) ; action-query summary ; query->token attention (layers < m) ; position]."""
 
-    def __init__(self, M=512, pca_dim=512, text_dim=4096, n_attn=64, d=256, d_attn=64, d_pos=64, hidden=512, dropout=0.1):
+    FEATURES = ("hv", "hq", "avis", "pos")
+
+    def __init__(self, M=512, pca_dim=512, text_dim=4096, n_attn=64, d=256, d_attn=64, d_pos=64, hidden=512, dropout=0.1,
+                 n_out=1, drop=()):
         super().__init__()
-        self.M = M
-        self.v = nn.Linear(pca_dim, d)
-        self.t = nn.Sequential(nn.LayerNorm(text_dim), nn.Linear(text_dim, d))
-        self.a = nn.Linear(n_attn, d_attn)
-        self.pos = nn.Embedding(M, d_pos)
+        assert set(drop) <= set(self.FEATURES) and len(drop) < len(self.FEATURES), drop
+        self.M, self.n_out, self.drop = M, n_out, tuple(drop)  # drop: input features left out (ablation)
+        self.v = nn.Linear(pca_dim, d) if "hv" not in drop else None
+        self.t = nn.Sequential(nn.LayerNorm(text_dim), nn.Linear(text_dim, d)) if "hq" not in drop else None
+        self.a = nn.Linear(n_attn, d_attn) if "avis" not in drop else None
+        self.pos = nn.Embedding(M, d_pos) if "pos" not in drop else None
+        d_in = sum(n for f, n in zip(self.FEATURES, (d, d, d_attn, d_pos)) if f not in drop)
         self.mlp = nn.Sequential(
-            nn.Linear(2 * d + d_attn + d_pos, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_in, hidden), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(hidden, hidden), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden, 1),
+            nn.Linear(hidden, n_out),  # n_out = 2: action / instruction heads on a shared trunk (two-head ranker)
         )
 
     def forward(self, hv, hq, avis):
-        """hv (B, M, P), hq (B, 4096), avis (B, n_attn, M) -> logits (B, M)."""
+        """hv (B, M, P), hq (B, 4096), avis (B, n_attn, M) -> logits (B, M), or (B, M, n_out) for n_out > 1."""
         B, M = hv.shape[0], hv.shape[1]
-        t = self.t(hq)[:, None].expand(-1, M, -1)
-        a = self.a(torch.log(avis.transpose(1, 2) + 1e-6))
-        p = self.pos.weight[None].expand(B, -1, -1)
-        return self.mlp(torch.cat([self.v(hv), t, a, p], dim=-1)).squeeze(-1)
+        x = []
+        if self.v is not None:
+            x.append(self.v(hv))
+        if self.t is not None:
+            x.append(self.t(hq)[:, None].expand(-1, M, -1))
+        if self.a is not None:
+            x.append(self.a(torch.log(avis.transpose(1, 2) + 1e-6)))
+        if self.pos is not None:
+            x.append(self.pos.weight[None].expand(B, -1, -1))
+        out = self.mlp(torch.cat(x, dim=-1))
+        return out.squeeze(-1) if self.n_out == 1 else out
+
+
+def combine_heads(logits, w):
+    """Two-head ranker: (B, M, 2) action / instruction logits -> (1 - w) softmax(act) + w softmax(instr), as the label."""
+    return (1 - w) * torch.softmax(logits[..., 0], dim=-1) + w * torch.softmax(logits[..., 1], dim=-1)
 
 
 def depth_from_scores(score, n_l):
@@ -104,19 +123,42 @@ class TokenDepthPredictor:
         ck = torch.load(ckpt_path, map_location="cpu")
         pca = np.load(Path(ck["feature_dir"]) / "pca.npz")
         self.mu, self.sd, self.comp = (torch.tensor(pca[k], device=device) for k in ("mean", "std", "components"))
-        self.model = DepthRanker(M=ck["M"], pca_dim=self.comp.shape[1], dropout=ck["args"]["dropout"]).to(device).eval()
+        k = ck["args"].get("pca_dim")  # ranker trained on the first k PCA coordinates
+        if k:
+            self.comp = self.comp[:, :k].contiguous()
+        self.two_head = bool(ck.get("two_head", False))
+        self.model = DepthRanker(M=ck["M"], pca_dim=self.comp.shape[1], dropout=ck["args"]["dropout"],
+                                 n_out=2 if self.two_head else 1, drop=ck["args"].get("drop") or ()).to(device).eval()
+        # instruction weight at inference (OFT_HEAD_WEIGHT; default: the label mix the schedule was built with)
+        self.w = float(os.environ.get("OFT_HEAD_WEIGHT") or ck.get("mix") or 0.5)
         self.model.load_state_dict(ck["model"])
-        self.schedule = ck["schedule"]
+        self.uses_avis = self.model.a is not None  # False: no attention rows needed (layers < m can run on SDPA)
+        # the ranker is budget-free: the schedule (budget) comes from OFT_SCHEDULE (make_schedule.py); older
+        # checkpoints also carry the schedule they were selected with
+        min_depth = ck.get("min_depth", ck.get("schedule", {}).get("min_depth"))
+        if os.environ.get("OFT_SCHEDULE"):
+            self.schedule = json.load(open(os.environ["OFT_SCHEDULE"]))
+        else:
+            assert "schedule" in ck, "budget-free checkpoint: set OFT_SCHEDULE (make_schedule.py)"
+            self.schedule = ck["schedule"]
+        assert self.schedule["min_depth"] == min_depth and sum(self.schedule["n_l"]) == self.schedule["budget"]
         self.n_l = torch.tensor(self.schedule["n_l"], device=device)
         self.layer = int(self.schedule["min_depth"])
         self.M = ck["M"]
 
     @torch.no_grad()
-    def __call__(self, hidden_states, attn_rows, img_start, act_start, act_end):
+    def score(self, hidden_states, attn_rows, img_start, act_start, act_end):
+        """(1, M) ranking score (higher = kept in more layers)."""
+        if attn_rows is None:  # ranker trained without avis: placeholder (ignored by DepthRanker)
+            attn_rows = hidden_states.new_zeros(1, 1, self.M)
         hv, hq, av = query_features(hidden_states, attn_rows, img_start, self.M, act_start, act_end)
         hv = ((hv - self.mu) / self.sd) @ self.comp
         score = self.model(hv[None], hq[None], av[None])
-        return depth_from_scores(score, self.n_l)[0]
+        return combine_heads(score, self.w) if self.two_head else score
+
+    @torch.no_grad()
+    def __call__(self, hidden_states, attn_rows, img_start, act_start, act_end):
+        return depth_from_scores(self.score(hidden_states, attn_rows, img_start, act_start, act_end), self.n_l)[0]
 
 
 # --------------------------------------------------------------------------------------------- depth forward
@@ -185,7 +227,11 @@ def install_depth_forward(vla, predictor):
     def fastv_forward(self, input_ids=None, attention_mask=None, position_ids=None, past_key_values=None,
                       inputs_embeds=None, use_cache=None, output_attentions=None, output_hidden_states=None,
                       return_dict=None, cache_position=None, fastv_config=None):
-        if fastv_config is None or float(fastv_config.get("fastv_r", 0.0)) == 0.0:  # warm start: full tokens
+        # The ranker needs no action history, so by default it prunes from the first query; VLA-Pruner's warm start
+        # (full tokens until its attention history fills, fastv_r = 0) is kept only with OFT_WARMUP=1. With OFT's
+        # 8-action chunks an episode is ~10-20 queries, so 3 full warm-start queries would add a lot of visual tokens.
+        warm = float(fastv_config.get("fastv_r", 0.0)) == 0.0 if fastv_config is not None else True
+        if fastv_config is None or (warm and os.environ.get("OFT_WARMUP") == "1"):
             return official(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
                             past_key_values=past_key_values, inputs_embeds=inputs_embeds, use_cache=use_cache,
                             output_attentions=output_attentions, output_hidden_states=output_hidden_states,

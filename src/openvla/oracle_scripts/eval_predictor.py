@@ -63,22 +63,26 @@ def main():
     n_l = torch.tensor(sched["n_l"], device=DEVICE)
     feat_dir = Path(f"/workspace/vla/data/oracle_features/{suite}")
     pca = np.load(feat_dir / "pca.npz")
-    model = DepthRanker(pca_dim=pca["components"].shape[1], dropout=targs["dropout"]).to(DEVICE)
+    drop, kp = targs.get("drop") or (), targs.get("pca_dim")
+    model = DepthRanker(pca_dim=kp or pca["components"].shape[1], dropout=targs["dropout"], drop=drop).to(DEVICE)
     model.load_state_dict(ck["model"])
     model.eval()
 
     def predict(hv, hlast, avis):
         with torch.no_grad():
-            return torch.cat([model(hv[i:i + 256].float(), hlast[i:i + 256].float(), avis[i:i + 256].float())
+            return torch.cat([model(hv[i:i + 256].float(), hlast[i:i + 256].float(),
+                                    avis[i:i + 256].float() if model.use_avis else None)
                               for i in range(0, len(hv), 256)])
 
     def baselines(pred, r, avis):
-        return {"predictor": pred, "attn_l01": avis.float().mean(1),
-                "mean_target": (r / r.sum(1, keepdim=True)).mean(0, keepdim=True).expand_as(r)}
+        out = {"predictor": pred, "mean_target": (r / r.sum(1, keepdim=True)).mean(0, keepdim=True).expand_as(r)}
+        if avis.shape[-1] == r.shape[1]:
+            out["attn_l01"] = avis.float().mean(1)
+        return out
 
     # (1) RLDS validation demos
     _, val_files = load_split(suite, targs["val_frac"], targs["seed"])
-    va = {k: v.to(DEVICE) for k, v in load(val_files, suite, with_s=True).items()}
+    va = {k: v.to(DEVICE) for k, v in load(val_files, suite, with_s=True, use_avis="avis" not in drop, pca_dim=kp).items()}
     pred = predict(va["hv"], va["hlast"], va["avis"])
     s, r = va["s"].float(), va["r"]
     table(f"RLDS val demos: {len(val_files)} demos, {len(r)} frames",
@@ -96,6 +100,7 @@ def main():
     processor = get_processor(cfg)
     D = vla.get_action_dim(suite)
     mu, sd, comp = (torch.tensor(pca[k], device=DEVICE) for k in ("mean", "std", "components"))
+    comp = comp[:, :kp] if kp else comp
     S, R, HV, HL, AV = [], [], [], [], []
     for f in obs_files:
         d = np.load(f)

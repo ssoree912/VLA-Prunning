@@ -1,0 +1,62 @@
+diff --git a/openvla-oft/experiments/robot/libero/run_libero_eval.py b/openvla-oft/experiments/robot/libero/run_libero_eval.py
+index 981e36b..1ea1011 100644
+--- a/openvla-oft/experiments/robot/libero/run_libero_eval.py
++++ b/openvla-oft/experiments/robot/libero/run_libero_eval.py
+@@ -4,7 +4,7 @@ run_libero_eval.py
+ Evaluates a trained policy in a LIBERO simulation benchmark task suite.
+ """
+ import os
+-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
++os.environ.setdefault("CUDA_VISIBLE_DEVICES", "4")  # respect the caller's GPU choice
+ 
+ import json
+ import logging
+@@ -520,8 +520,8 @@ def run_task(
+ 
+         # Handle initial state
+         if cfg.initial_states_path == "DEFAULT":
+-            # Use default initial state
+-            initial_state = initial_states[episode_idx]
++            # Use default initial state (SPEC_INIT_OFFSET: first initial state, added for extending a finished run)
++            initial_state = initial_states[episode_idx + int(os.environ.get("SPEC_INIT_OFFSET", "0"))]
+         else:
+             # Get keys for fetching initial episode state from JSON
+             initial_states_task_key = task_description.replace(" ", "_")
+@@ -654,7 +654,9 @@ WRIST_SIM_THRESHOLD = {WRIST_SIM_THRESHOLD}''', log_file)
+ 
+     # Start evaluation
+     total_episodes, total_successes = 0, 0
+-    for task_id in tqdm.tqdm(range(num_tasks)):
++    # SPEC_TASK_IDS="4,5,6": run only these tasks (sharding across processes; added for parallel evaluation)
++    task_ids = [int(t) for t in os.environ["SPEC_TASK_IDS"].split(",")] if os.environ.get("SPEC_TASK_IDS") else range(num_tasks)
++    for task_id in tqdm.tqdm(task_ids):
+ 
+         # -----------------------------------
+         # if task_id<= 8:
+diff --git a/openvla-oft/experiments/robot/spec_prune_constants.py b/openvla-oft/experiments/robot/spec_prune_constants.py
+index 5807d3f..c3b59d0 100644
+--- a/openvla-oft/experiments/robot/spec_prune_constants.py
++++ b/openvla-oft/experiments/robot/spec_prune_constants.py
+@@ -13,6 +13,8 @@
+ # Visual token layout inserted after BOS: 256 primary-view patches followed by
+ # 256 wrist-view patches. Token ids are sequence positions in the multimodal
+ # LLaMA input.
++import os  # local edit: SPEC_ALPHA / SPEC_DYN_RATIO env overrides (defaults = released values) for operating-point sweeps
++
+ NUM_VISION_TOKENS_PER_VIEW = 256
+ PRIMARY_VISUAL_TOKEN_START = 1
+ WRIST_VISUAL_TOKEN_START = PRIMARY_VISUAL_TOKEN_START + NUM_VISION_TOKENS_PER_VIEW
+@@ -20,11 +22,11 @@ VISUAL_TOKEN_END = WRIST_VISUAL_TOKEN_START + NUM_VISION_TOKENS_PER_VIEW
+ 
+ # Dynamic pruning keeps this fraction of the current sequence at each target
+ # layer. Non-visual tokens are always protected.
+-DYNAMIC_PRUNE_RATIO = 0.9
++DYNAMIC_PRUNE_RATIO = float(os.environ.get("SPEC_DYN_RATIO", 0.9))
+ 
+ # Scales early text-guided local selection. Values below 1 prune more
+ # aggressively in the first two layers.
+-STATIC_PRUNE_RATIO = 0.8
++STATIC_PRUNE_RATIO = float(os.environ.get("SPEC_ALPHA", 0.8))
+ 
+ # First-two-layer text-guided local task-relevant token budgets.
+ ATTN_TOPK = int(30 * STATIC_PRUNE_RATIO)
